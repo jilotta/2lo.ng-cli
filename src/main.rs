@@ -6,8 +6,6 @@ struct Link {
     link: String,
 }
 
-struct Entry(String, String);
-
 #[derive(Debug)]
 struct Offline;
 #[derive(PartialEq, Debug)]
@@ -15,6 +13,21 @@ enum ResultOrOffline<T, E> {
     Ok(T),
     Err(E),
     Offline,
+}
+impl<T, E> ResultOrOffline<T, E> {
+    fn is_err(&self) -> bool {
+        matches!(*self, ResultOrOffline::Err(_))
+    }
+    fn is_offline(&self) -> bool {
+        matches!(*self, ResultOrOffline::Offline)
+    }
+    fn unwrap(self) -> T {
+        if let ResultOrOffline::Ok(s) = self {
+            s
+        } else {
+            panic!("ResultOrOffline not OK")
+        }
+    }
 }
 
 const HOST: &str = "http://localhost:8080";
@@ -27,7 +40,10 @@ macro_rules! url {
     };
 }
 
-async fn add(client: &Mutex<Client>, url: &str) -> Result<Entry, Offline> {
+async fn add(
+    client: &Mutex<Client>,
+    url: &str,
+) -> Result<(String, String), Offline> {
     let params = Link {
         link: url.to_string(),
     };
@@ -39,7 +55,7 @@ async fn add(client: &Mutex<Client>, url: &str) -> Result<Entry, Offline> {
     let result = result.unwrap();
     let text = result.text().await.unwrap();
     let mut text = text.split(' ');
-    Ok(Entry(
+    Ok((
         text.next()
             .expect("Server error: Expected NUMID")
             .to_string(),
@@ -56,7 +72,7 @@ async fn add_with_strid(
     client: &Mutex<Client>,
     url: &str,
     strid: &str,
-) -> Result<Entry, StridNotUnique> {
+) -> ResultOrOffline<(String, String), StridNotUnique> {
     let params = Link {
         link: url.to_string(),
     };
@@ -66,16 +82,20 @@ async fn add_with_strid(
         .post(url!("api/add", strid))
         .form(&params)
         .send()
-        .await
-        .unwrap();
+        .await;
 
+    if result.is_err() {
+        return ResultOrOffline::Offline;
+    }
+
+    let result = result.unwrap();
     if result.status() == reqwest::StatusCode::CONFLICT {
-        return Err(StridNotUnique);
+        return ResultOrOffline::Err(StridNotUnique);
     }
 
     let text = result.text().await.unwrap();
     let mut text = text.split(' ');
-    Ok(Entry(
+    ResultOrOffline::Ok((
         text.next()
             .expect("Server error: Expected NUMID")
             .to_string(),
@@ -91,7 +111,7 @@ struct NotFound;
 async fn stats(
     client: &Mutex<Client>,
     strid: &str,
-) -> ResultOrOffline<i64, NotFound> {
+) -> ResultOrOffline<(String, String), NotFound> {
     let client = client.lock().await;
     let result = client.get(url!("api/stats", strid)).send().await;
 
@@ -104,7 +124,13 @@ async fn stats(
         ResultOrOffline::Err(NotFound)
     } else {
         let text = result.text().await.unwrap();
-        ResultOrOffline::Ok(text.parse::<i64>().unwrap())
+        let mut text = text.split(' ');
+        ResultOrOffline::Ok((
+            text.next()
+                .expect("Server error: Expected CLICKS")
+                .to_string(),
+            text.next().expect("Server error: Expected URL").to_string(),
+        ))
     }
 }
 
@@ -112,7 +138,7 @@ async fn stats(
 async fn main() {
     let subcommand = std::env::args().nth(1);
     if subcommand.is_none() {
-        let command_name: String = std::env::args().nth(0).unwrap();
+        let command_name: String = std::env::args().next().unwrap();
         println!("[!] No arguments given!");
         println!("<?> Help:");
         println!(
@@ -126,14 +152,15 @@ async fn main() {
     let client = Mutex::new(Client::new());
     if subcommand.unwrap().to_lowercase() == "stats" {
         for arg in std::env::args().skip(2) {
-            let clicks = stats(&client, &arg).await;
-            if let ResultOrOffline::Err(_) = clicks {
+            let stats = stats(&client, &arg).await;
+            if stats.is_err() {
                 println!("[!] {HOST}/{arg} not found");
-            } else if ResultOrOffline::Offline == clicks {
+            } else if stats.is_offline() {
                 println!("[!] Offline or {HOST} unreachable");
                 break;
-            } else if let ResultOrOffline::Ok(clicks) = clicks {
-                println!("{HOST}/{arg}: {} clicks", clicks)
+            } else {
+                let (clicks, url) = stats.unwrap();
+                println!("{HOST}/{arg}:\n  - {}\n  - {} clicks", url, clicks)
             }
         }
         return;
@@ -150,7 +177,7 @@ async fn main() {
                 println!("[!] Offline or {HOST} unreachable");
                 break;
             }
-            let Entry(numid, strid) = response.unwrap();
+            let (numid, strid) = response.unwrap();
             println!("{link}:\n  - {HOST}/{strid}\n  - {HOST}/.{numid}");
         } else {
             let strid = strid.unwrap();
@@ -172,9 +199,11 @@ async fn main() {
             let response = add_with_strid(&client, link, strid).await;
             if response.is_err() {
                 println!("[!] String ID `{}` already used", strid);
+            } else if response.is_offline() {
+                println!("[!] Offline or {HOST} unreachable");
             } else {
                 let response = response.unwrap();
-                let Entry(numid, strid) = response;
+                let (numid, strid) = response;
                 println!("{link}:\n  - {HOST}/{strid}\n  - {HOST}/.{numid}");
             }
         }
