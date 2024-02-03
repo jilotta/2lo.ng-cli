@@ -7,22 +7,29 @@ struct Link {
 }
 
 #[derive(Debug)]
-struct Offline;
+struct OfflineError;
+#[derive(Debug)]
+struct TooShort;
 #[derive(PartialEq, Debug)]
 enum ResultOrOffline<T, E> {
     Ok(T),
     Err(E),
-    Offline,
+    OfflineError,
 }
+
+use ResultOrOffline::Err;
+use ResultOrOffline::OfflineError as Offline;
+use ResultOrOffline::Ok;
+
 impl<T, E> ResultOrOffline<T, E> {
     fn is_err(&self) -> bool {
-        matches!(*self, ResultOrOffline::Err(_))
+        matches!(*self, Err(_))
     }
     fn is_offline(&self) -> bool {
-        matches!(*self, ResultOrOffline::Offline)
+        matches!(*self, Offline)
     }
     fn unwrap(self) -> T {
-        if let ResultOrOffline::Ok(s) = self {
+        if let Ok(s) = self {
             s
         } else {
             panic!("ResultOrOffline not OK")
@@ -43,16 +50,24 @@ macro_rules! url {
 async fn add(
     client: &Mutex<Client>,
     url: &str,
-) -> Result<(String, String), Offline> {
+) -> ResultOrOffline<(String, String), TooShort> {
     let params = Link {
         link: url.to_string(),
     };
-    let client = client.lock().await;
-    let result = client.post(url!("api/add")).form(&params).send().await;
+
+    let result = {
+        let client = client.lock().await;
+        client.post(url!("api/add")).form(&params).send().await
+    };
+
     if result.is_err() {
-        return Err(Offline);
+        return Offline;
     }
     let result = result.unwrap();
+    if result.status() == reqwest::StatusCode::URI_TOO_LONG {
+        return Err(TooShort);
+    }
+
     let text = result.text().await.unwrap();
     let mut text = text.split(' ');
     Ok((
@@ -76,26 +91,27 @@ async fn add_with_strid(
     let params = Link {
         link: url.to_string(),
     };
-    let client = client.lock().await;
 
+    let client = client.lock().await;
     let result = client
         .post(url!("api/add", strid))
         .form(&params)
         .send()
         .await;
+    drop(client);
 
     if result.is_err() {
-        return ResultOrOffline::Offline;
+        return Offline;
     }
 
     let result = result.unwrap();
     if result.status() == reqwest::StatusCode::CONFLICT {
-        return ResultOrOffline::Err(StridNotUnique);
+        return Err(StridNotUnique);
     }
 
     let text = result.text().await.unwrap();
     let mut text = text.split(' ');
-    ResultOrOffline::Ok((
+    Ok((
         text.next()
             .expect("Server error: Expected NUMID")
             .to_string(),
@@ -114,18 +130,19 @@ async fn stats(
 ) -> ResultOrOffline<(String, String), NotFound> {
     let client = client.lock().await;
     let result = client.get(url!("api/stats", strid)).send().await;
+    drop(client);
 
     if result.is_err() {
-        return ResultOrOffline::Offline;
+        return Offline;
     }
 
     let result = result.unwrap();
     if result.status() == reqwest::StatusCode::NOT_FOUND {
-        ResultOrOffline::Err(NotFound)
+        Err(NotFound)
     } else {
         let text = result.text().await.unwrap();
         let mut text = text.split(' ');
-        ResultOrOffline::Ok((
+        Ok((
             text.next()
                 .expect("Server error: Expected CLICKS")
                 .to_string(),
@@ -134,77 +151,85 @@ async fn stats(
     }
 }
 
+fn is_valid(strid: &str) -> bool {
+    strid
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 #[tokio::main]
 async fn main() {
     let subcommand = std::env::args().nth(1);
     if subcommand.is_none() {
         let command_name: String = std::env::args().next().unwrap();
-        println!("[!] No arguments given!");
-        println!("<?> Help:");
-        println!(
+        eprintln!("[!] No arguments given!");
+        eprintln!("<?> Help:");
+        eprintln!(
             "The URLs are written in the `<url>(+<strid>)` format. \
              The `+` is a separator."
         );
-        println!("{command_name} <urls>       | add every url listed");
-        println!("{command_name} stats <urls> | check stats of every url");
+        eprintln!("{command_name} <urls>       | add every url listed");
+        eprintln!("{command_name} stats <urls> | check stats of every url");
         return;
     }
+
     let client = Mutex::new(Client::new());
+
     if subcommand.unwrap().to_lowercase() == "stats" {
         for arg in std::env::args().skip(2) {
             let stats = stats(&client, &arg).await;
             if stats.is_err() {
-                println!("[!] {HOST}/{arg} not found");
+                eprintln!("[!] {HOST}/{arg} not found");
             } else if stats.is_offline() {
-                println!("[!] Offline or {HOST} unreachable");
+                eprintln!("[!] Offline or {HOST} unreachable");
                 break;
             } else {
                 let (clicks, url) = stats.unwrap();
                 println!("{HOST}/{arg}:\n  - {}\n  - {} clicks", url, clicks)
             }
         }
-        return;
-    }
+    } else {
+        for arg in std::env::args().skip(1) {
+            let mut splitted_arg = arg.split('+');
+            let link = splitted_arg.next().unwrap();
+            let strid = splitted_arg.next();
 
-    for arg in std::env::args().skip(1) {
-        let mut splitted_arg = arg.split('+');
-        let link = splitted_arg.next().unwrap();
-        let strid = splitted_arg.next();
-
-        if strid.is_none() {
-            let response = add(&client, link).await;
-            if response.is_err() {
-                println!("[!] Offline or {HOST} unreachable");
-                break;
-            }
-            let (numid, strid) = response.unwrap();
-            println!("{link}:\n  - {HOST}/{strid}\n  - {HOST}/.{numid}");
-        } else {
-            let strid = strid.unwrap();
-            if !strid
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            {
-                println!(
-                    "[!] String ID `{strid}` invalid. \
-                          A String ID must only contain:"
-                );
-                println!("  - latin letters (A-Z and a-z");
-                println!("  - minuses (-)");
-                println!("  - underscores (_)");
-                println!("  - numbers (0-9)");
-                continue;
-            }
-
-            let response = add_with_strid(&client, link, strid).await;
-            if response.is_err() {
-                println!("[!] String ID `{}` already used", strid);
-            } else if response.is_offline() {
-                println!("[!] Offline or {HOST} unreachable");
-            } else {
-                let response = response.unwrap();
-                let (numid, strid) = response;
+            if strid.is_none() {
+                let response = add(&client, link).await;
+                if response.is_offline() {
+                    eprintln!("[!] Offline or {HOST} unreachable");
+                    break;
+                } else if response.is_err() {
+                    eprintln!("[!] `{link}` is too short to be shortened");
+                    break;
+                }
+                let (numid, strid) = response.unwrap();
                 println!("{link}:\n  - {HOST}/{strid}\n  - {HOST}/.{numid}");
+            } else {
+                let strid = strid.unwrap();
+                if !is_valid(strid) {
+                    eprintln!(
+                        "[!] String ID `{strid}` invalid. \
+                         A String ID must only contain:"
+                    );
+                    eprintln!("  - latin letters (A-Z and a-z");
+                    eprintln!("  - minuses (-)");
+                    eprintln!("  - underscores (_)");
+                    eprintln!("  - numbers (0-9)");
+                    continue;
+                }
+
+                let response = add_with_strid(&client, link, strid).await;
+                if response.is_err() {
+                    eprintln!("[!] String ID `{}` already used", strid);
+                } else if response.is_offline() {
+                    eprintln!("[!] Offline or {HOST} unreachable");
+                } else {
+                    let (numid, strid) = response.unwrap();
+                    println!(
+                        "{link}:\n  - {HOST}/{strid}\n  - {HOST}/.{numid}"
+                    );
+                }
             }
         }
     }
