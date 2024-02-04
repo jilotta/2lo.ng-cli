@@ -6,6 +6,7 @@ struct Link {
     link: String,
 }
 
+//errors
 #[derive(Debug)]
 struct OfflineError;
 #[derive(Debug)]
